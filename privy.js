@@ -8,7 +8,8 @@ dotenv.config();
 const PRIVY_CONFIG = {
     timeout: 15000, // 15s timeout for wallet operations
     walletApi: {
-        apiURL: 'https://api.privy.io'
+        apiURL: 'https://api.privy.io',
+        authorization: process.env.PRIVY_PRIVATE_KEY
     }
 };
 
