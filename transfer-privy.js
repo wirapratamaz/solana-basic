@@ -44,8 +44,7 @@ const transferDevnetSOL = async () => {
           chainConfig: {
             solana: { network: "devnet" },
           },
-          authorizationPrivateKey:
-            "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2rNfzXFqOV0UGXSemlRZBVFhVlPM5TSYNEw0ucod4YmhRANCAATFYXVUH8zu6emxnEmvm9wODDp3z0qhoDFUIKVAF4ocKz7XFZkQGVfVcKAyjh+KQjhtIVEfI2WP6Ev9T4N2HbmK",
+          authorizationPrivateKey: process.env.PRIVY_AUTHORIZATION_PRIVATE_KEY,
         },
       }
     );
