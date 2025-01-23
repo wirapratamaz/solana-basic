@@ -4,21 +4,78 @@ import {
   PublicKey,
   SystemProgram,
   Transaction,
+  TransactionMessage,
+  VersionedTransaction,
   LAMPORTS_PER_SOL,
   Keypair
 } from "@solana/web3.js";
 import bs58 from "bs58";
 import dotenv from "dotenv";
+import BN from "bn.js";
 dotenv.config();
 
 class WithdrawalManager {
   constructor() {
     this.client = new PrivyClient(
       process.env.PRIVY_APP_ID,
-      process.env.PRIVY_APP_SECRET
+      process.env.PRIVY_APP_SECRET,
+      {
+        walletApi: {
+          chainConfig: {
+            solana: { network: "devnet" }
+          },
+          authorizationPrivateKey: 'MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2rNfzXFqOV0UGXSemlRZBVFhVlPM5TSYNEw0ucod4YmhRANCAATFYXVUH8zu6emxnEmvm9wODDp3z0qhoDFUIKVAF4ocKz7XFZkQGVfVcKAyjh+KQjhtIVEfI2WP6Ev9T4N2HbmK',
+        }
+      }
     );
     this.connection = new Connection("https://api.devnet.solana.com", "confirmed");
-    this.withdrawals = new Map(); // In-memory storage (replace with your database)
+    this.withdrawals = new Map();
+  }
+
+  /**
+   * Get or create Privy-managed wallet for user
+   * @param {string} accountId - User account identifier
+   * @returns {Promise<Object>} - Privy wallet details
+   */
+  async getPrivyWallet(accountId) {
+    const idempotencyKey = `wallet-${accountId}`;
+    
+    try {
+      return await this.client.walletApi.create({
+        chainType: "solana",
+        idempotencyKey,
+      });
+    } catch (error) {
+      if (error.status === 409) { // Wallet already exists
+        return this.client.walletApi.get(idempotencyKey);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Fund a Privy wallet with SOL
+   * @param {string} accountId - User account ID
+   * @param {number} lamports - Amount to fund
+   */
+  async fundPrivyWallet(accountId, lamports) {
+    const privyWallet = await this.getPrivyWallet(accountId);
+    const funderKeypair = Keypair.fromSecretKey(
+      bs58.decode(process.env.SOLANA_DEVNET_SECRET_KEY)
+    );
+    
+    const transaction = new Transaction()
+      .add(
+        SystemProgram.transfer({
+          fromPubkey: funderKeypair.publicKey,
+          toPubkey: new PublicKey(privyWallet.address),
+          lamports,
+        })
+      );
+    
+    const signature = await this.connection.sendTransaction(transaction, [funderKeypair]);
+    await this.connection.confirmTransaction(signature);
+    return signature;
   }
 
   /**
@@ -36,22 +93,6 @@ class WithdrawalManager {
   }
 
   /**
-   * Check wallet balance
-   * @param {string} address - Wallet address to check
-   * @param {number} amount - Amount in lamports to validate against
-   * @returns {Promise<boolean>} - Whether wallet has sufficient balance
-   */
-  async checkBalance(address, amount) {
-    try {
-      const balance = await this.connection.getBalance(new PublicKey(address));
-      return balance >= amount;
-    } catch (error) {
-      console.error("Balance check failed:", error);
-      return false;
-    }
-  }
-
-  /**
    * Submit a withdrawal request
    * @param {Object} params - Withdrawal parameters
    * @param {string} params.accountId - User account ID
@@ -62,51 +103,62 @@ class WithdrawalManager {
    */
   async submitWithdrawal({ accountId, recipient, amount, idempotencyKey }) {
     try {
-      // 1. Validate recipient address
+      // 1. Get Privy-managed wallet
+      const privyWallet = await this.getPrivyWallet(accountId);
+      
+      // 2. Validate and check balance
       if (!this.validateAddress(recipient)) {
         throw new Error("Invalid recipient address");
       }
 
-      // 2. Setup sender wallet from environment
-      const secretKey = bs58.decode(process.env.SOLANA_DEVNET_SECRET_KEY);
-      const fromWallet = Keypair.fromSecretKey(secretKey);
-
-      // 3. Check balance
-      const hasBalance = await this.checkBalance(fromWallet.publicKey.toString(), amount);
-      if (!hasBalance) {
-        throw new Error("Insufficient balance");
+      const balance = await this.connection.getBalance(
+        new PublicKey(privyWallet.address)
+      );
+      
+      if (balance < parseInt(amount)) {
+        throw new Error("Insufficient balance in Privy wallet");
       }
 
-      // 4. Create transfer instruction
+      // 3. Create transaction using VersionedTransaction
       const { blockhash } = await this.connection.getLatestBlockhash("finalized");
       
-      const transaction = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: fromWallet.publicKey,
-          toPubkey: new PublicKey(recipient),
-          lamports: parseInt(amount),
-        })
-      );
+      // Build transaction message
+      const message = new TransactionMessage({
+        payerKey: new PublicKey(privyWallet.address),
+        recentBlockhash: blockhash,
+        instructions: [
+          SystemProgram.transfer({
+            fromPubkey: new PublicKey(privyWallet.address),
+            toPubkey: new PublicKey(recipient),
+            lamports: parseInt(amount),
+          })
+        ]
+      }).compileToV0Message();
 
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = fromWallet.publicKey;
+      const transaction = new VersionedTransaction(message);
 
-      // 5. Sign and send transaction
-      transaction.sign(fromWallet);
-      const signature = await this.connection.sendRawTransaction(transaction.serialize());
-      await this.connection.confirmTransaction(signature);
+      // 4. Serialize and send via Privy
+      const serializedTx = transaction.serialize();
 
-      // 6. Record withdrawal
+      const privyResponse = await this.client.walletApi.solana.signAndSendTransaction({
+        walletId: privyWallet.id,
+        chainType: "solana",
+        transaction: serializedTx,
+        idempotencyKey,
+        headers: { "privy-network": "devnet" }
+      });
+
+      // 5. Record withdrawal
       const withdrawal = {
         id: `withdraw_${Date.now()}`,
         accountId,
         chainId: "solana:devnet",
-        walletAddress: fromWallet.publicKey.toString(),
+        walletAddress: privyWallet.address,
         recipient,
         amount,
-        hash: signature,
+        hash: privyResponse.transactionHash,
         blockTimestamp: Math.floor(Date.now() / 1000),
-        status: "confirmed"
+        status: "pending" // Update via webhook later
       };
 
       this.withdrawals.set(withdrawal.id, withdrawal);
@@ -114,7 +166,7 @@ class WithdrawalManager {
       return withdrawal;
 
     } catch (error) {
-      console.error("Withdrawal failed:", error);
+      console.error("Privy withdrawal failed:", error.response?.data || error.message);
       throw error;
     }
   }
@@ -165,8 +217,17 @@ const manager = new WithdrawalManager();
 // Submit withdrawal example
 async function testWithdrawal() {
   try {
+    // First, create and fund a Privy wallet
+    const accountId = "user_12345";
+    const fundingAmount = 0.2 * LAMPORTS_PER_SOL; // Fund with 0.2 SOL
+    
+    console.log("Creating and funding Privy wallet...");
+    const fundingSignature = await manager.fundPrivyWallet(accountId, fundingAmount);
+    console.log("Wallet funded:", fundingSignature);
+
+    // Then submit withdrawal
     const withdrawal = await manager.submitWithdrawal({
-      accountId: "user_12345",
+      accountId,
       recipient: process.env.RECIPIENT_DEVNET_ADDRESS,
       amount: (0.1 * LAMPORTS_PER_SOL).toString(),
       idempotencyKey: `withdraw_${Date.now()}`
@@ -178,10 +239,10 @@ async function testWithdrawal() {
     const withdrawals = manager.getWithdrawals({
       accountId: "user_12345",
       chainId: "solana:devnet",
-      status: "confirmed"
+      status: "pending"
     });
     
-    console.log("Recent withdrawals:", withdrawals);
+    console.log("Pending withdrawals:", withdrawals);
     
   } catch (error) {
     console.error("Test failed:", error);
@@ -189,5 +250,5 @@ async function testWithdrawal() {
 }
 
 // Run test
-console.log("Testing Withdrawal Management System...");
+console.log("Testing Withdrawal Management System with Privy...");
 testWithdrawal(); 
